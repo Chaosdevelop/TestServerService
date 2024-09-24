@@ -1,63 +1,60 @@
-using System;
+using System.Collections;
 using System.Collections.Generic;
 using System.IO;
-using System.Net.Http;
 using System.Text;
-using System.Threading.Tasks;
 using Newtonsoft.Json;
 using UnityEngine;
+using UnityEngine.Networking;
 
 public class EventService : MonoBehaviour
 {
 	// Путь к папке хранения данных проекта
 	string Path => System.IO.Path.Combine(Application.persistentDataPath, savedEventsFilePath);
 
+	[SerializeField]
 	private string savedEventsFilePath = "events.json";
-	private string serverUrl = "http://your-analytics-server.com/events";
+	[SerializeField]
+	private string serverUrl = "https://your-analytics-server.com/events";
+	[SerializeField]
 	private float cooldownBeforeSend = 1f;
 
-	// Используем один экземпляр HttpClient, которые будет использоваться повторно
-	private HttpClient client;
 	// Список всех событий для отправки
 	private List<EventData> events = new List<EventData>();
 	// Список событий ожидающих отправки, т.к. в момент отправки общий список events может изменится.
 	private List<EventData> pendingEvents = new List<EventData>();
 	// Task отправки событий
-	private Task sendEventsTask = Task.CompletedTask;
+	private Coroutine sendEventsCoroutine;
 
-
-
-	//Должен быть вызван до выполнения Start, например на стадии Awake
-	public void Initialize(string savedEventsFilePath, string serverUrl, float cooldownBeforeSend, HttpClient client)
+	//Лучше инициализировать значения из какого-нибудь конфига проекта до вызова Start
+	public void Initialize(string savedEventsFilePath, string serverUrl, float cooldownBeforeSend)
 	{
 		this.savedEventsFilePath = savedEventsFilePath;
 		this.serverUrl = serverUrl;
 		this.cooldownBeforeSend = cooldownBeforeSend;
-		this.client = client;
 	}
 
-	private async void Start()
+	private void Start()
 	{
 		LoadEvents();
-
-		// Отправляем события на сервер
-		await SendEventsAsync();
+		// Запускаем отправку событий
+		sendEventsCoroutine = StartCoroutine(SendEvents());
 	}
+
+
 
 	private void LoadEvents()
 	{
 		// Проверяем, существует ли файл с событиями
-		if (File.Exists(savedEventsFilePath))
+		if (File.Exists(Path))
 		{
 			// Читаем события из файла
-			string json = File.ReadAllText(savedEventsFilePath);
-			List<EventData> savedEvents = JsonConvert.DeserializeObject<List<EventData>>(json);
+			string json = File.ReadAllText(Path);
+			var eventsList = JsonConvert.DeserializeObject<EventsList>(json);
 
 			// Добавляем сохраненные события в список отправки
-			events.AddRange(savedEvents);
+			events.AddRange(eventsList.events);
 		}
 	}
-
 
 	// Метод для отслеживания события
 	public void TrackEvent(string type, string data)
@@ -65,50 +62,58 @@ public class EventService : MonoBehaviour
 		// Добавляем событие в список
 		events.Add(new EventData { type = type, data = data });
 
-		// Если кулдаун еще не запущен, запускаем его
-		if (sendEventsTask.IsCompleted)
+		// Если отправка событий еще не запущена, запускаем ее
+		if (sendEventsCoroutine == null)
 		{
-			sendEventsTask = SendEventsAsync();
+			sendEventsCoroutine = StartCoroutine(SendEvents());
 		}
 	}
 
 	// Асинхронный метод отправки событий
-	private async Task SendEventsAsync()
+	private IEnumerator SendEvents()
 	{
 		// Только если есть события для отправки
-		if (events.Count == 0) return;
+		if (events.Count == 0)
+		{
+			yield break;
+		}
 
 		pendingEvents.AddRange(events);
 		events.Clear();
 
 		// Преобразуем события в JSON
-		var json = JsonConvert.SerializeObject(new { events = pendingEvents });
+		var json = JsonConvert.SerializeObject(new EventsList { events = pendingEvents });
 
-		var content = new StringContent(json, Encoding.UTF8, "application/json");
-
-		// Отправляем запрос и проверяем результат
-		try
+		// Создаем UnityWebRequest для отправки POST-запроса
+		using (UnityWebRequest request = UnityWebRequest.Post(serverUrl, json, "application/json"))
 		{
-			var response = await client.PostAsync(serverUrl, content);
+			byte[] bodyRaw = Encoding.UTF8.GetBytes(json);
+			request.uploadHandler = new UploadHandlerRaw(bodyRaw);
 
-			// Если отправка прошла успешно
-			if (response.IsSuccessStatusCode)
+			// Отправляем запрос
+			yield return request.SendWebRequest();
+
+			// Проверяем результат
+			if (request.result == UnityWebRequest.Result.Success)
 			{
 				pendingEvents.Clear();
+				Debug.Log("Succesfull send!");
 			}
-		}
-		catch (Exception)
-		{
-			// Обработка ошибки
-			Debug.LogError("Something went wrong when posting events.");
+			else
+			{
+				Debug.LogError("Events sending error: " + request.error);
+			}
 		}
 
 		//В любом случае сохраняем список событий(пустой или не очень)
 		SaveEvents();
-		// Ждем кулдауна
-		await Task.Delay((int)(cooldownBeforeSend * 1000));
-	}
 
+		// Ждем кулдауна
+		yield return new WaitForSeconds(cooldownBeforeSend);
+
+		// Сбрасываем корутину
+		sendEventsCoroutine = null;
+	}
 
 	//Не сохраняем все события каждый раз при добавлении нового, а только в случае неудачной отправки. Будем считать, что сохранение игрового прогресса синхронизировано с сохранением ивентов.
 	private void SaveEvents()
@@ -118,11 +123,24 @@ public class EventService : MonoBehaviour
 		// Сохраняем события в файл
 		if (events.Count > 0)
 		{
-			var json = JsonConvert.SerializeObject(new { events = events });
-			File.WriteAllText(Path, json);
+			var json = JsonConvert.SerializeObject(new EventsList { events = events });
+			try
+			{
+				File.WriteAllText(Path, json);
+			}
+			catch
+			{
+				Debug.LogError("Cant write events to file");
+			}
+
 		}
 	}
 
+	//Обертка списка для сохранения формата отправляемых данных
+	private struct EventsList
+	{
+		public List<EventData> events;
+	}
 
 	// Модель события
 	private struct EventData
